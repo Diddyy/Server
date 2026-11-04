@@ -230,7 +230,8 @@ public sealed class ModerationService(
         if (userId is null)
             return;
 
-        var next = await NextSanctionTypeAsync(db, userId.Value);
+        if (await NextSanctionTypeAsync(db, userId.Value) is not { } next)
+            return;
         var account = await db.Users.Where(u => u.Id == userId).Select(u => u.AccountId).FirstAsync();
         await messenger.SendAsync(moderatorId, new CfhSanctionMessageComposer(
             issueId, account, next.Name, next.LengthHours, next.ProbationDays, false, NoText, NoText));
@@ -512,7 +513,9 @@ public sealed class ModerationService(
         if (target.Rank >= await RankOfAsync(db, moderatorId))
             return new LadderSanction(ModerationOutcome.Rank);
 
-        var next = await NextSanctionTypeAsync(db, target.Id);
+        // a hotel without a sanction ladder has no next step to give
+        if (await NextSanctionTypeAsync(db, target.Id) is not { } next)
+            return new LadderSanction(ModerationOutcome.Type);
         if (next.Kind == SanctionKind.Ban && !await MayAsync(db, moderatorId, PermissionNames.ModerationBan))
             return new LadderSanction(ModerationOutcome.Permission, next.Kind, next.Id);
 
@@ -523,10 +526,12 @@ public sealed class ModerationService(
     }
 
     /// <summary>The next step of the ladder for a user: one up from their last laddered sanction
-    /// while they are still on probation for it, the first step otherwise.</summary>
-    private static async Task<SanctionType> NextSanctionTypeAsync(AppDbContext db, Guid userId)
+    /// while they are still on probation for it, the first step otherwise; null when the hotel has no ladder.</summary>
+    private static async Task<SanctionType?> NextSanctionTypeAsync(AppDbContext db, Guid userId)
     {
         var ladder = await db.SanctionTypes.AsNoTracking().OrderBy(t => t.Step).ToListAsync();
+        if (ladder.Count == 0)
+            return null;
         var last = await db.Sanctions.AsNoTracking()
             .Where(s => s.UserId == userId && s.SanctionTypeId != null)
             .OrderByDescending(s => s.CreatedAt)
@@ -845,7 +850,11 @@ public sealed class ModerationService(
             .Where(s => s.UserId == playerId && s.SanctionTypeId != null)
             .OrderByDescending(s => s.CreatedAt)
             .ToListAsync();
-        var next = await NextSanctionTypeAsync(db, playerId);
+        if (await NextSanctionTypeAsync(db, playerId) is not { } next)
+        {
+            await messenger.SendAsync(playerId, new MySanctionStatusMessageComposer([]));
+            return;
+        }
 
         await messenger.SendAsync(playerId, new MySanctionStatusMessageComposer(sanctions.Take(1).Select(s =>
         {

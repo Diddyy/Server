@@ -104,6 +104,22 @@ public class ModerationServiceTests
     }
 
     [Fact]
+    public async Task AHotelWithoutALadderRefusesTheDefaultSanctionInsteadOfFailing()
+    {
+        var target = _hotel.AddUser(SecurityLevel.AboveNone);
+        await using (var db = _hotel.Db())
+        {
+            db.SanctionTypes.RemoveRange(db.SanctionTypes);
+            await db.SaveChangesAsync();
+        }
+
+        var outcome = await _hotel.Service.DefaultSanctionAsync(_hotel.Moderator.Id, target.AccountId, 0, "behave", null);
+
+        Assert.Equal(new LadderSanction(ModerationOutcome.Type), outcome);
+        Assert.Empty(_hotel.Db().Sanctions);
+    }
+
+    [Fact]
     public async Task TheLadderStopsAtABanTheModeratorMayNotGive()
     {
         var target = _hotel.AddUser(SecurityLevel.AboveNone);
