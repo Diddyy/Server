@@ -76,6 +76,8 @@ try
     if (roles.Web)
     {
         builder.Services.AddWebSeam(configuration);
+        // the CMS bridge is mapped only when a secret is set (see CmsBridgeEndpoints)
+        builder.Services.Configure<Habbo.Web.CmsBridgeOptions>(configuration.GetSection(Habbo.Web.CmsBridgeOptions.Section));
         // copied rooms are imported by the website's API, straight into the database
         builder.Services.Configure<Habbo.Silo.Rooms.RoomOptions>(configuration.GetSection("Rooms"));
         builder.Services.AddSingleton<Habbo.Silo.Rooms.Copies.RoomImporter>();
@@ -228,6 +230,9 @@ try
     app.MapHabboImagingEndpoints();
     app.MapClientDiagnosticsEndpoints();
     app.MapRoomImportEndpoints();
+    // the bridge acts on players through their grains, so it needs the game in this process too
+    if (roles.Game && CmsBridgeEndpoints.IsEnabled(configuration))
+        app.MapCmsBridgeEndpoints();
     app.Run();
 }
 catch (Exception ex)

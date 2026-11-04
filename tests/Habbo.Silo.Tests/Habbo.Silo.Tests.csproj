@@ -17,6 +17,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Habbo.Silo\Habbo.Silo.csproj" />
     <ProjectReference Include="..\..\src\Habbo.Protocol\Habbo.Protocol.csproj" />
+    <ProjectReference Include="..\..\src\Habbo.Web\Habbo.Web.csproj" />
   </ItemGroup>
 
 </Project>
