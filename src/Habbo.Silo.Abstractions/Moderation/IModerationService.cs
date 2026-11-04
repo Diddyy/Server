@@ -13,14 +13,15 @@ public interface IModerationService
     /// <summary>A ban that keeps this player, or this machine, out; null when there is none.</summary>
     Task<ActiveBan?> FindBanAsync(Guid playerId, string machineId);
 
-    Task PickIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, bool retryEnabled, int retryCount, string message);
+    Task<IssuesPicked> PickIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, bool retryEnabled, int retryCount, string message);
 
-    Task ReleaseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds);
+    /// <summary>Gives back issues the moderator picked; the ones given back.</summary>
+    Task<IReadOnlyList<int>> ReleaseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds);
 
-    Task CloseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, int closeReason);
+    Task<IssuesClosed> CloseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, int closeReason);
 
     /// <summary>Closes an issue bundle, giving its reported user the default sanction for the topic.</summary>
-    Task CloseWithDefaultSanctionAsync(Guid moderatorId, int issueId, IReadOnlyList<int> otherIssueIds, int topicId);
+    Task<ModerationOutcome> CloseWithDefaultSanctionAsync(Guid moderatorId, int issueId, IReadOnlyList<int> otherIssueIds, int topicId);
 
     /// <summary>What a default sanction would be for an issue's reported user, or for an account.</summary>
     Task SendSanctionPreviewAsync(Guid moderatorId, int issueId, int accountId, int topicId);
@@ -38,16 +39,19 @@ public interface IModerationService
     Task SendUserInfoAsync(Guid moderatorId, int accountId);
 
     /// <summary>A caution, message, mute, kick, ban or trade lock for a user.</summary>
-    Task SanctionAsync(Guid moderatorId, ModerationAction action);
+    Task<ModerationOutcome> SanctionAsync(Guid moderatorId, ModerationAction action);
 
-    /// <summary>The next step of the sanction ladder for a user.</summary>
-    Task DefaultSanctionAsync(Guid moderatorId, int accountId, int topicId, string message, int? issueId);
+    /// <summary>The next step of the sanction ladder for a user; which step it was.</summary>
+    Task<LadderSanction> DefaultSanctionAsync(Guid moderatorId, int accountId, int topicId, string message, int? issueId);
 
     /// <summary>A message (or caution) to everyone in the moderator's room, and perhaps out they go.</summary>
     Task RoomActionAsync(Guid moderatorId, int actionType, string message);
 
+    /// <summary>A message (or caution) to everyone in a room but staff, and perhaps out they go.</summary>
+    Task<ModerationOutcome> RoomMessageAsync(Guid moderatorId, int roomId, string message, bool caution, bool kick);
+
     /// <summary>Takes a room in hand: locks its door, renames it, empties it.</summary>
-    Task ModerateRoomAsync(Guid moderatorId, int roomId, bool lockDoor, bool changeTitle, bool kickUsers);
+    Task<ModerationOutcome> ModerateRoomAsync(Guid moderatorId, int roomId, bool lockDoor, bool changeTitle, bool kickUsers);
 
     Task SavePreferencesAsync(Guid moderatorId, int x, int y, int width, int height);
 

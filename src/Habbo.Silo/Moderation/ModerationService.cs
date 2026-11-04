@@ -110,11 +110,11 @@ public sealed class ModerationService(
         return ban is null ? null : new ActiveBan(ban.Message, ban.ExpiresAt!.Value);
     }
 
-    public async Task PickIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, bool retryEnabled, int retryCount, string message)
+    public async Task<IssuesPicked> PickIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, bool retryEnabled, int retryCount, string message)
     {
         await using var db = await dbFactory.CreateDbContextAsync();
         if (!await MayAsync(db, moderatorId, PermissionNames.ModerationCallForHelp))
-            return;
+            return new IssuesPicked(ModerationOutcome.Permission, [], []);
 
         var issues = await db.ModerationIssues.Include(i => i.Picker)
             .Where(i => issueIds.Contains(i.Id) && i.State != ModerationIssueState.Closed)
@@ -125,7 +125,7 @@ public sealed class ModerationService(
             await messenger.SendAsync(moderatorId, new IssuePickFailedMessageComposer(
                 taken.Select(i => new PickFailedIssueData(i.Id, i.Picker?.AccountId ?? 0, i.Picker?.Username ?? string.Empty)).ToList(),
                 retryEnabled, retryCount));
-            return;
+            return new IssuesPicked(ModerationOutcome.Done, [], taken.Select(i => new TakenIssue(i.Id, i.Picker?.Username ?? string.Empty)).ToList());
         }
 
         foreach (var issue in issues)
@@ -136,9 +136,10 @@ public sealed class ModerationService(
 
         await db.SaveChangesAsync();
         await BroadcastIssuesAsync(db, issues.Select(i => i.Id));
+        return new IssuesPicked(ModerationOutcome.Done, issues.Select(i => i.Id).ToList(), []);
     }
 
-    public async Task ReleaseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds)
+    public async Task<IReadOnlyList<int>> ReleaseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds)
     {
         await using var db = await dbFactory.CreateDbContextAsync();
         var issues = await db.ModerationIssues
@@ -152,39 +153,46 @@ public sealed class ModerationService(
 
         await db.SaveChangesAsync();
         await BroadcastIssuesAsync(db, issues.Select(i => i.Id));
+        return issues.Select(i => i.Id).ToList();
     }
 
-    public async Task CloseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, int closeReason)
+    public async Task<IssuesClosed> CloseIssuesAsync(Guid moderatorId, IReadOnlyList<int> issueIds, int closeReason)
     {
+        // a reason the mod tool does not have closes nothing
         if (!Enum.IsDefined(typeof(ModerationCloseReason), closeReason))
-            return;
+            return new IssuesClosed(ModerationOutcome.Type, []);
 
         await using var db = await dbFactory.CreateDbContextAsync();
         if (!await MayAsync(db, moderatorId, PermissionNames.ModerationCallForHelp))
-            return;
+            return new IssuesClosed(ModerationOutcome.Permission, []);
 
-        await CloseAsync(db, moderatorId, issueIds, (ModerationCloseReason)closeReason, sanctioned: false);
+        return new IssuesClosed(ModerationOutcome.Done,
+            await CloseAsync(db, moderatorId, issueIds, (ModerationCloseReason)closeReason, sanctioned: false));
     }
 
-    public async Task CloseWithDefaultSanctionAsync(Guid moderatorId, int issueId, IReadOnlyList<int> otherIssueIds, int topicId)
+    public async Task<ModerationOutcome> CloseWithDefaultSanctionAsync(Guid moderatorId, int issueId, IReadOnlyList<int> otherIssueIds, int topicId)
     {
         await using var db = await dbFactory.CreateDbContextAsync();
         // only an issue this moderator picked and has not closed: a repeat must not climb the ladder again
         var issue = await db.ModerationIssues.Include(i => i.ReportedUser).FirstOrDefaultAsync(i =>
             i.Id == issueId && i.State == ModerationIssueState.Picked && i.PickerId == moderatorId);
-        if (issue is null || !await MayAsync(db, moderatorId, PermissionNames.ModerationCallForHelp))
-            return;
+        if (issue is null)
+            return ModerationOutcome.NotFound;
+        if (!await MayAsync(db, moderatorId, PermissionNames.ModerationCallForHelp))
+            return ModerationOutcome.Permission;
 
         // resolved with a sanction only when the sanction was given: one the moderator may not give leaves the issue open
-        if (issue.ReportedUser is { } reported && !await TryDefaultSanctionAsync(moderatorId, reported.AccountId, topicId, NoText, issueId))
-            return;
+        if (issue.ReportedUser is { } reported
+            && await DefaultSanctionAsync(moderatorId, reported.AccountId, topicId, NoText, issueId) is { Outcome: not ModerationOutcome.Done } refused)
+            return refused.Outcome;
 
         await CloseAsync(db, moderatorId, [issueId, .. otherIssueIds], ModerationCloseReason.Resolved, sanctioned: issue.ReportedUser is not null);
+        return ModerationOutcome.Done;
     }
 
     /// <summary>Closes issues the moderator picked: the reporters are told how, and the mod tools drop them. Another
-    /// moderator's issues, and those nobody picked, are theirs to close.</summary>
-    private async Task CloseAsync(AppDbContext db, Guid moderatorId, IReadOnlyList<int> issueIds, ModerationCloseReason reason, bool sanctioned)
+    /// moderator's issues, and those nobody picked, are theirs to close. The ones it closed.</summary>
+    private async Task<IReadOnlyList<int>> CloseAsync(AppDbContext db, Guid moderatorId, IReadOnlyList<int> issueIds, ModerationCloseReason reason, bool sanctioned)
     {
         var issues = await db.ModerationIssues
             .Where(i => issueIds.Contains(i.Id) && i.State == ModerationIssueState.Picked && i.PickerId == moderatorId).ToListAsync();
@@ -204,6 +212,8 @@ public sealed class ModerationService(
                 await messenger.SendAsync(reporter, new IssueCloseNotificationMessageComposer((int)reason, NoText));
             await messenger.SendAsync(await OnlineModeratorsAsync(db), new IssueDeletedMessageComposer(Key(issue.Id)));
         }
+
+        return issues.Select(i => i.Id).ToList();
     }
 
     public async Task SendSanctionPreviewAsync(Guid moderatorId, int issueId, int accountId, int topicId)
@@ -435,9 +445,8 @@ public sealed class ModerationService(
     private const string ClubClassification = "club";
     private const string RegularClassification = "regular";
 
-    public async Task SanctionAsync(Guid moderatorId, ModerationAction action)
+    public async Task<ModerationOutcome> SanctionAsync(Guid moderatorId, ModerationAction action)
     {
-        var rules = options.Value;
         await using var db = await dbFactory.CreateDbContextAsync();
         var required = action.Kind switch
         {
@@ -446,10 +455,14 @@ public sealed class ModerationService(
             _ => PermissionNames.ModerationAlert,
         };
         var target = await db.Users.FirstOrDefaultAsync(u => u.AccountId == action.AccountId);
-        if (target is null || !await MayAsync(db, moderatorId, required) || target.Rank >= await RankOfAsync(db, moderatorId))
+        var refused = target is null ? ModerationOutcome.NotFound
+            : !await MayAsync(db, moderatorId, required) ? ModerationOutcome.Permission
+            : target.Rank >= await RankOfAsync(db, moderatorId) ? ModerationOutcome.Rank
+            : ModerationOutcome.Done;
+        if (target is null || refused != ModerationOutcome.Done)
         {
             await messenger.SendAsync(moderatorId, new ModeratorActionResultMessageComposer(action.AccountId, false));
-            return;
+            return refused;
         }
 
         DateTimeOffset? expires = null;
@@ -469,7 +482,7 @@ public sealed class ModerationService(
                 if (ban is null)
                 {
                     await messenger.SendAsync(moderatorId, new ModeratorActionResultMessageComposer(action.AccountId, false));
-                    return;
+                    return ModerationOutcome.Type;
                 }
 
                 typeId = ban.Id;
@@ -483,27 +496,30 @@ public sealed class ModerationService(
 
         await ApplyAsync(db, moderatorId, target, action.Kind, typeId, action.TopicId, action.Message, action.IssueId, expires, action.AvatarOnly);
         await messenger.SendAsync(moderatorId, new ModeratorActionResultMessageComposer(action.AccountId, true));
+        return ModerationOutcome.Done;
     }
 
-    public Task DefaultSanctionAsync(Guid moderatorId, int accountId, int topicId, string message, int? issueId) =>
-        TryDefaultSanctionAsync(moderatorId, accountId, topicId, message, issueId);
-
-    /// <summary>Gives the user the next sanction of the ladder; false when the moderator may not (rank, permission).</summary>
-    private async Task<bool> TryDefaultSanctionAsync(Guid moderatorId, int accountId, int topicId, string message, int? issueId)
+    /// <summary>Gives the user the next sanction of the ladder; refused when the moderator may not (rank, permission),
+    /// and then nothing is said to the mod tool.</summary>
+    public async Task<LadderSanction> DefaultSanctionAsync(Guid moderatorId, int accountId, int topicId, string message, int? issueId)
     {
         await using var db = await dbFactory.CreateDbContextAsync();
         var target = await db.Users.FirstOrDefaultAsync(u => u.AccountId == accountId);
-        if (target is null || !await MayAsync(db, moderatorId, PermissionNames.ModerationAlert) || target.Rank >= await RankOfAsync(db, moderatorId))
-            return false;
+        if (target is null)
+            return new LadderSanction(ModerationOutcome.NotFound);
+        if (!await MayAsync(db, moderatorId, PermissionNames.ModerationAlert))
+            return new LadderSanction(ModerationOutcome.Permission);
+        if (target.Rank >= await RankOfAsync(db, moderatorId))
+            return new LadderSanction(ModerationOutcome.Rank);
 
         var next = await NextSanctionTypeAsync(db, target.Id);
         if (next.Kind == SanctionKind.Ban && !await MayAsync(db, moderatorId, PermissionNames.ModerationBan))
-            return false;
+            return new LadderSanction(ModerationOutcome.Permission, next.Kind, next.Id);
 
         var expires = next.LengthHours > 0 ? DateTimeOffset.UtcNow.AddHours(next.LengthHours) : (DateTimeOffset?)null;
         await ApplyAsync(db, moderatorId, target, next.Kind, next.Id, topicId, message, issueId, expires, avatarOnly: false);
         await messenger.SendAsync(moderatorId, new ModeratorActionResultMessageComposer(accountId, true));
-        return true;
+        return new LadderSanction(ModerationOutcome.Done, next.Kind, next.Id);
     }
 
     /// <summary>The next step of the ladder for a user: one up from their last laddered sanction
@@ -597,27 +613,38 @@ public sealed class ModerationService(
 
     public async Task RoomActionAsync(Guid moderatorId, int actionType, string message)
     {
-        var rules = options.Value;
-        await using var db = await dbFactory.CreateDbContextAsync();
-        var kick = actionType is RoomCautionAndKick or RoomMessageAndKick;
-        if (!await MayAsync(db, moderatorId, kick ? PermissionNames.ModerationRoomKick : PermissionNames.ModerationRoomAlert)
+        if (actionType is not (RoomCaution or RoomCautionAndKick or RoomMessage or RoomMessageAndKick)
             || await grains.GetGrain<IPlayerGrain>(moderatorId).GetCurrentRoomAsync() is not { } roomId)
             return;
 
-        var caution = actionType is RoomCaution or RoomCautionAndKick;
-        if (actionType is RoomCaution or RoomCautionAndKick or RoomMessage or RoomMessageAndKick)
-            await grains.GetGrain<IGameRoomGrain>(roomId).StaffMessageAsync(message, caution, kick);
+        await RoomMessageAsync(moderatorId, roomId, message,
+            caution: actionType is RoomCaution or RoomCautionAndKick,
+            kick: actionType is RoomCautionAndKick or RoomMessageAndKick);
     }
 
-    public async Task ModerateRoomAsync(Guid moderatorId, int roomId, bool lockDoor, bool changeTitle, bool kickUsers)
+    public async Task<ModerationOutcome> RoomMessageAsync(Guid moderatorId, int roomId, string message, bool caution, bool kick)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync();
+        if (!await MayAsync(db, moderatorId, kick ? PermissionNames.ModerationRoomKick : PermissionNames.ModerationRoomAlert))
+            return ModerationOutcome.Permission;
+        if (!await db.Rooms.AnyAsync(r => r.Id == roomId))
+            return ModerationOutcome.NotFound;
+
+        await grains.GetGrain<IGameRoomGrain>(roomId).StaffMessageAsync(message, caution, kick);
+        return ModerationOutcome.Done;
+    }
+
+    public async Task<ModerationOutcome> ModerateRoomAsync(Guid moderatorId, int roomId, bool lockDoor, bool changeTitle, bool kickUsers)
     {
         var rules = options.Value;
         await using var db = await dbFactory.CreateDbContextAsync();
-        if (!await MayAsync(db, moderatorId, kickUsers ? PermissionNames.ModerationRoomKick : PermissionNames.ModerationRoomAlert)
-            || !await db.Rooms.AnyAsync(r => r.Id == roomId))
-            return;
+        if (!await MayAsync(db, moderatorId, kickUsers ? PermissionNames.ModerationRoomKick : PermissionNames.ModerationRoomAlert))
+            return ModerationOutcome.Permission;
+        if (!await db.Rooms.AnyAsync(r => r.Id == roomId))
+            return ModerationOutcome.NotFound;
 
         await grains.GetGrain<IGameRoomGrain>(roomId).StaffModerateAsync(lockDoor, changeTitle ? rules.ModeratedRoomName : null, kickUsers);
+        return ModerationOutcome.Done;
     }
 
     public async Task SavePreferencesAsync(Guid moderatorId, int x, int y, int width, int height)
