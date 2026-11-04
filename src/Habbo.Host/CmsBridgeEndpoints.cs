@@ -9,6 +9,7 @@ using Habbo.Protocol.Messages.Outgoing.Moderation;
 using Habbo.Protocol.Messages.Outgoing.Notifications;
 using Habbo.Protocol.Messages.Outgoing.Perk;
 using Habbo.Silo.Abstractions.Achievements;
+using Habbo.Silo.Abstractions.Catalog;
 using Habbo.Silo.Abstractions.Moderation;
 using Habbo.Silo.Abstractions.Navigator;
 using Habbo.Silo.Abstractions.Players;
@@ -46,6 +47,7 @@ public static class CmsBridgeEndpoints
         cms.MapPost("/players/{id:guid}/reload", ReloadAsync);
         cms.MapPost("/players/{id:guid}/alert", AlertAsync);
         cms.MapPost("/players/{id:guid}/disconnect", DisconnectAsync);
+        cms.MapPost("/players/{id:guid}/voucher", RedeemVoucherAsync);
         cms.MapPost("/players/{id:guid}/sanction", SanctionAsync);
         cms.MapPost("/players/{id:guid}/sanction/next", NextSanctionAsync);
         cms.MapPost("/issues/pick", PickIssuesAsync);
@@ -226,6 +228,22 @@ public static class CmsBridgeEndpoints
         return Results.Ok(new { online = true });
     }
 
+    /// <summary>Redeems a voucher for a player from the website, as typing it in the catalog would (the same checks,
+    /// rewards and wrong-code pause); an online player's client hears about it too.</summary>
+    private static async Task<IResult> RedeemVoucherAsync(
+        Guid id, VoucherRequest request, IGrainFactory grains, IVoucherService vouchers, IDbContextFactory<AppDbContext> dbFactory,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.Code))
+            return Results.BadRequest(new { error = "code" });
+        if (await AccountIdOfAsync(dbFactory, id, ct) is null)
+            return Results.NotFound();
+
+        var player = await grains.GetGrain<IPlayerGrain>(id).GetDataAsync();
+        var result = await vouchers.RedeemAsync(player, request.Code);
+        return Results.Ok(new { redeemed = result.Redeemed, credits = result.Credits, points = result.Points, pointType = result.PointType, offer = result.Offer });
+    }
+
     private static async Task<IResult> HotelAlertAsync(
         MessageRequest request, IGrainFactory grains, PlayerMessenger messenger, IOptions<CmsBridgeOptions> options)
     {
@@ -382,6 +400,8 @@ public static class CmsBridgeEndpoints
     public sealed record MessageRequest(string? Message);
 
     public sealed record DisconnectRequest(bool Banned, string? Message);
+
+    public sealed record VoucherRequest(string? Code);
 
     /// <summary>A sanction from <paramref name="ModeratorId"/> (the staff member's user id): <paramref name="Kind"/>
     /// is alert, mute, kick, trade_lock, message or ban; a ban needs the ladder's <paramref name="SanctionTypeId"/>,

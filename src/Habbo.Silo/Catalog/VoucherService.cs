@@ -38,14 +38,14 @@ public sealed class VoucherService(
             (_, wrong) => now - wrong.Since >= WrongCodePause ? (1, now) : (wrong.Count + 1, wrong.Since));
     }
 
-    public async Task RedeemAsync(PlayerData player, string code)
+    public async Task<VoucherRedeemResult> RedeemAsync(PlayerData player, string code)
     {
         code = code.Trim();
         // codes can be guessed: a player who keeps getting them wrong is not let try again for a while
         if (!MayTry(player.Id))
         {
             await messenger.SendAsync(player.Id, new VoucherRedeemErrorMessageComposer(VoucherRedeemErrorMessageComposer.Invalid));
-            return;
+            return VoucherRedeemResult.Refused;
         }
 
         await using var db = await dbFactory.CreateDbContextAsync();
@@ -58,7 +58,7 @@ public sealed class VoucherService(
         {
             Failed(player.Id);
             await messenger.SendAsync(player.Id, new VoucherRedeemErrorMessageComposer(VoucherRedeemErrorMessageComposer.Invalid));
-            return;
+            return VoucherRedeemResult.Refused;
         }
 
         // the player's redemption goes in first, so the same player redeeming twice at once fails on its key rather than
@@ -81,7 +81,7 @@ public sealed class VoucherService(
             {
                 await transaction.RollbackAsync();
                 await messenger.SendAsync(player.Id, new VoucherRedeemErrorMessageComposer(VoucherRedeemErrorMessageComposer.Invalid));
-                return;
+                return VoucherRedeemResult.Refused;
             }
 
             await transaction.CommitAsync();
@@ -98,6 +98,7 @@ public sealed class VoucherService(
             await playerGrain.AddActivityPointsAsync(voucher.ActivityPointType, voucher.ActivityPoints, VoucherReason);
 
         var (name, description) = (string.Empty, string.Empty);
+        string? handedOver = null;
         if (voucher.OfferId is { } offerId && await catalog.GetOfferAsync(offerId) is { } offer)
         {
             var free = offer with { PriceInCredits = 0, PriceInActivityPoints = 0, ClubLevel = ClubLevel.None };
@@ -106,9 +107,11 @@ public sealed class VoucherService(
             {
                 await playerGrain.AnnounceItemsAsync(result.ItemIds ?? []);
                 (name, description) = (offer.LocalizationId, offer.LocalizationId);
+                handedOver = offer.LocalizationId;
             }
         }
 
         await messenger.SendAsync(player.Id, new VoucherRedeemOkMessageComposer(description, name));
+        return new VoucherRedeemResult(true, voucher.Credits, voucher.ActivityPoints, voucher.ActivityPointType, handedOver);
     }
 }
